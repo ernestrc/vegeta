@@ -130,7 +130,7 @@ func attack(opts *attackOpts) (err error) {
 	}
 
 	var (
-		tr  vegeta.Targeter
+		tr  vegeta.TargeterProvider
 		src = files[opts.targetsf]
 		hdr = opts.headers.Header
 	)
