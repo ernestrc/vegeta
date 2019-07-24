@@ -89,7 +89,7 @@ func BenchmarkLTTB(b *testing.B) {
 		}
 	})
 
-	b.Run("tsenart", func(b *testing.B) {
+	b.Run("ernestrc", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			Downsample(len(data), 1000, newIterator(points[0]))
 		}

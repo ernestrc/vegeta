@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	vegeta "github.com/tsenart/vegeta/lib"
+	vegeta "github.com/ernestrc/vegeta/lib"
 )
 
 func file(name string, create bool) (*os.File, error) {
