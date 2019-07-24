@@ -103,11 +103,82 @@ const (
 
 // A Targeter decodes a Target or returns an error in case of failure.
 // Implementations must be safe for concurrent use.
-type Targeter func(*Target) error
+type Targeter interface {
+	Next(*Target) error
+	Result([]byte, uint16, error)
+}
 
-// Decode is a convenience method that calls the underlying Targeter function.
-func (tr Targeter) Decode(t *Target) error {
-	return tr(t)
+// TargeterProvider instantiates new targeters
+type TargeterProvider interface {
+	NewTargeter() Targeter
+}
+
+type jsonTargeter struct {
+	src    io.Reader
+	body   []byte
+	header http.Header
+	lock   sync.Mutex
+	reader *bufio.Reader
+}
+
+func (d *jsonTargeter) Result(b []byte, code uint16, err error) {}
+
+// NewTargeter returns same jsontargeter, because it's immutable
+func (d *jsonTargeter) NewTargeter() Targeter { return d }
+
+func (d *jsonTargeter) Next(tgt *Target) (err error) {
+	if tgt == nil {
+		return ErrNilTarget
+	}
+
+	var jl jlexer.Lexer
+
+	d.lock.Lock()
+	for len(jl.Data) == 0 {
+		if jl.Data, err = d.reader.ReadBytes('\n'); err != nil {
+			break
+		}
+		jl.Data = bytes.TrimSpace(jl.Data) // Skip empty lines
+	}
+	d.lock.Unlock()
+
+	if err != nil {
+		if err == io.EOF {
+			err = ErrNoTargets
+		}
+		return err
+	}
+
+	var t jsonTarget
+	t.decode(&jl)
+
+	if err = jl.Error(); err != nil {
+		return err
+	} else if t.Method == "" {
+		return ErrNoMethod
+	} else if t.URL == "" {
+		return ErrNoURL
+	}
+
+	tgt.Method = t.Method
+	tgt.URL = t.URL
+	if tgt.Body = d.body; len(t.Body) > 0 {
+		tgt.Body = t.Body
+	}
+
+	if tgt.Header == nil {
+		tgt.Header = http.Header{}
+	}
+
+	for k, vs := range d.header {
+		tgt.Header[k] = append(tgt.Header[k], vs...)
+	}
+
+	for k, vs := range t.Header {
+		tgt.Header[k] = append(tgt.Header[k], vs...)
+	}
+
+	return nil
 }
 
 // NewJSONTargeter returns a new targeter that decodes one Target from the
@@ -122,66 +193,11 @@ func (tr Targeter) Decode(t *Target) error {
 // body will be set as the Target's body if no body is provided in each target definiton.
 // hdr will be merged with the each Target's headers.
 //
-func NewJSONTargeter(src io.Reader, body []byte, header http.Header) Targeter {
-	type reader struct {
-		*bufio.Reader
-		sync.Mutex
-	}
-	rd := reader{Reader: bufio.NewReader(src)}
-
-	return func(tgt *Target) (err error) {
-		if tgt == nil {
-			return ErrNilTarget
-		}
-
-		var jl jlexer.Lexer
-
-		rd.Lock()
-		for len(jl.Data) == 0 {
-			if jl.Data, err = rd.ReadBytes('\n'); err != nil {
-				break
-			}
-			jl.Data = bytes.TrimSpace(jl.Data) // Skip empty lines
-		}
-		rd.Unlock()
-
-		if err != nil {
-			if err == io.EOF {
-				err = ErrNoTargets
-			}
-			return err
-		}
-
-		var t jsonTarget
-		t.decode(&jl)
-
-		if err = jl.Error(); err != nil {
-			return err
-		} else if t.Method == "" {
-			return ErrNoMethod
-		} else if t.URL == "" {
-			return ErrNoURL
-		}
-
-		tgt.Method = t.Method
-		tgt.URL = t.URL
-		if tgt.Body = body; len(t.Body) > 0 {
-			tgt.Body = t.Body
-		}
-
-		if tgt.Header == nil {
-			tgt.Header = http.Header{}
-		}
-
-		for k, vs := range header {
-			tgt.Header[k] = append(tgt.Header[k], vs...)
-		}
-
-		for k, vs := range t.Header {
-			tgt.Header[k] = append(tgt.Header[k], vs...)
-		}
-
-		return nil
+func NewJSONTargeter(src io.Reader, body []byte, header http.Header) TargeterProvider {
+	return &jsonTargeter{
+		body:   body,
+		header: header,
+		reader: bufio.NewReader(src),
 	}
 }
 
@@ -207,24 +223,38 @@ func NewJSONTargetEncoder(w io.Writer) TargetEncoder {
 	}
 }
 
+type staticTargeter struct {
+	tgts []Target
+	i    int64
+}
+
+func (s *staticTargeter) Next(tgt *Target) error {
+	if tgt == nil {
+		return ErrNilTarget
+	}
+	*tgt = s.tgts[atomic.AddInt64(&s.i, 1)%int64(len(s.tgts))]
+	return nil
+}
+
+func (s *staticTargeter) Result(body []byte, code uint16, err error) {
+	// noop
+}
+
+// NewTargeter returns same staticTargeter, because it's immutable
+func (s *staticTargeter) NewTargeter() Targeter { return s }
+
 // NewStaticTargeter returns a Targeter which round-robins over the passed
 // Targets.
-func NewStaticTargeter(tgts ...Target) Targeter {
-	i := int64(-1)
-	return func(tgt *Target) error {
-		if tgt == nil {
-			return ErrNilTarget
-		}
-		*tgt = tgts[atomic.AddInt64(&i, 1)%int64(len(tgts))]
-		return nil
-	}
+func NewStaticTargeter(tgts ...Target) TargeterProvider {
+	return &staticTargeter{tgts: tgts, i: -1}
 }
 
 // ReadAllTargets eagerly reads all Targets out of the provided Targeter.
-func ReadAllTargets(t Targeter) (tgts []Target, err error) {
+func ReadAllTargets(t TargeterProvider) (tgts []Target, err error) {
+	tr := t.NewTargeter()
 	for {
 		var tgt Target
-		if err = t(&tgt); err == ErrNoTargets {
+		if err = tr.Next(&tgt); err == ErrNoTargets {
 			break
 		} else if err != nil {
 			return nil, err
@@ -239,6 +269,89 @@ func ReadAllTargets(t Targeter) (tgts []Target, err error) {
 	return tgts, nil
 }
 
+type httpTargeter struct {
+	body []byte
+	hdr  http.Header
+	sc   peekingScanner
+	mu   sync.Mutex
+}
+
+func (h *httpTargeter) Next(tgt *Target) (err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if tgt == nil {
+		return ErrNilTarget
+	}
+
+	var line string
+	for {
+		if !h.sc.Scan() {
+			return ErrNoTargets
+		}
+		line = strings.TrimSpace(h.sc.Text())
+
+		if len(line) != 0 && line[0] != '#' {
+			break
+		}
+	}
+
+	tgt.Body = h.body
+	tgt.Header = http.Header{}
+	for k, vs := range h.hdr {
+		tgt.Header[k] = vs
+	}
+
+	tokens := strings.SplitN(line, " ", 2)
+	if len(tokens) < 2 {
+		return fmt.Errorf("bad target: %s", line)
+	}
+	if !startsWithHTTPMethod(line) {
+		return fmt.Errorf("bad method: %s", tokens[0])
+	}
+	tgt.Method = tokens[0]
+	if _, err = url.ParseRequestURI(tokens[1]); err != nil {
+		return fmt.Errorf("bad URL: %s", tokens[1])
+	}
+	tgt.URL = tokens[1]
+	line = strings.TrimSpace(h.sc.Peek())
+	if line == "" || startsWithHTTPMethod(line) {
+		return nil
+	}
+	for h.sc.Scan() {
+		if line = strings.TrimSpace(h.sc.Text()); line == "" {
+			break
+		} else if strings.HasPrefix(line, "@") {
+			if tgt.Body, err = ioutil.ReadFile(line[1:]); err != nil {
+				return fmt.Errorf("bad body: %s", err)
+			}
+			break
+		}
+		tokens = strings.SplitN(line, ":", 2)
+		if len(tokens) < 2 {
+			return fmt.Errorf("bad header: %s", line)
+		}
+		for i := range tokens {
+			if tokens[i] = strings.TrimSpace(tokens[i]); tokens[i] == "" {
+				return fmt.Errorf("bad header: %s", line)
+			}
+		}
+		// Add key/value directly to the http.Header (map[string][]string).
+		// http.Header.Add() canonicalizes keys but vegeta is used
+		// to test systems that require case-sensitive headers.
+		tgt.Header[tokens[0]] = append(tgt.Header[tokens[0]], tokens[1])
+	}
+	if err = h.sc.Err(); err != nil {
+		return ErrNoTargets
+	}
+	return nil
+}
+
+func (h *httpTargeter) Result(body []byte, code uint16, err error) { /* noop */ }
+
+// NewTargeter returns same httpTargeter, because it's immutable
+func (h *httpTargeter) NewTargeter() Targeter { return h }
+
 // NewHTTPTargeter returns a new Targeter that decodes one Target from the
 // given io.Reader on every invocation. The format is as follows:
 //
@@ -252,79 +365,8 @@ func ReadAllTargets(t Targeter) (tgts []Target, err error) {
 //
 // body will be set as the Target's body if no body is provided.
 // hdr will be merged with the each Target's headers.
-func NewHTTPTargeter(src io.Reader, body []byte, hdr http.Header) Targeter {
-	var mu sync.Mutex
-	sc := peekingScanner{src: bufio.NewScanner(src)}
-	return func(tgt *Target) (err error) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if tgt == nil {
-			return ErrNilTarget
-		}
-
-		var line string
-		for {
-			if !sc.Scan() {
-				return ErrNoTargets
-			}
-			line = strings.TrimSpace(sc.Text())
-
-			if len(line) != 0 && line[0] != '#'{
-				break
-			}
-		}
-
-		tgt.Body = body
-		tgt.Header = http.Header{}
-		for k, vs := range hdr {
-			tgt.Header[k] = vs
-		}
-
-		tokens := strings.SplitN(line, " ", 2)
-		if len(tokens) < 2 {
-			return fmt.Errorf("bad target: %s", line)
-		}
-		if !startsWithHTTPMethod(line) {
-			return fmt.Errorf("bad method: %s", tokens[0])
-		}
-		tgt.Method = tokens[0]
-		if _, err = url.ParseRequestURI(tokens[1]); err != nil {
-			return fmt.Errorf("bad URL: %s", tokens[1])
-		}
-		tgt.URL = tokens[1]
-		line = strings.TrimSpace(sc.Peek())
-		if line == "" || startsWithHTTPMethod(line) {
-			return nil
-		}
-		for sc.Scan() {
-			if line = strings.TrimSpace(sc.Text()); line == "" {
-				break
-			} else if strings.HasPrefix(line, "@") {
-				if tgt.Body, err = ioutil.ReadFile(line[1:]); err != nil {
-					return fmt.Errorf("bad body: %s", err)
-				}
-				break
-			}
-			tokens = strings.SplitN(line, ":", 2)
-			if len(tokens) < 2 {
-				return fmt.Errorf("bad header: %s", line)
-			}
-			for i := range tokens {
-				if tokens[i] = strings.TrimSpace(tokens[i]); tokens[i] == "" {
-					return fmt.Errorf("bad header: %s", line)
-				}
-			}
-			// Add key/value directly to the http.Header (map[string][]string).
-			// http.Header.Add() canonicalizes keys but vegeta is used
-			// to test systems that require case-sensitive headers.
-			tgt.Header[tokens[0]] = append(tgt.Header[tokens[0]], tokens[1])
-		}
-		if err = sc.Err(); err != nil {
-			return ErrNoTargets
-		}
-		return nil
-	}
+func NewHTTPTargeter(src io.Reader, body []byte, hdr http.Header) TargeterProvider {
+	return &httpTargeter{body: body, hdr: hdr, sc: peekingScanner{src: bufio.NewScanner(src)}}
 }
 
 var httpMethodChecker = regexp.MustCompile("^[A-Z]+\\s")

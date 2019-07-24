@@ -233,7 +233,7 @@ func Client(c *http.Client) func(*Attacker) {
 // the rate specified by the Pacer. When the duration is zero the attack
 // runs until Stop is called. Results are sent to the returned channel as soon
 // as they arrive and will have their Attack field set to the given name.
-func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <-chan *Result {
+func (a *Attacker) Attack(tr TargeterProvider, p Pacer, du time.Duration, name string) <-chan *Result {
 	var wg sync.WaitGroup
 
 	workers := a.workers
@@ -245,7 +245,9 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 	ticks := make(chan struct{})
 	for i := uint64(0); i < workers; i++ {
 		wg.Add(1)
-		go a.attack(tr, name, &wg, ticks, results)
+		// instantiate one targeter per worker
+		targeter := tr.NewTargeter()
+		go a.attack(targeter, name, &wg, ticks, results)
 	}
 
 	go func() {
@@ -276,9 +278,9 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 					return
 				default:
 					// all workers are blocked. start one more and try again
-					workers++
 					wg.Add(1)
-					go a.attack(tr, name, &wg, ticks, results)
+					go a.attack(tr.NewTargeter(), name, &wg, ticks, results)
+					workers++
 				}
 			}
 
@@ -331,7 +333,7 @@ func (a *Attacker) hit(tr Targeter, name string) *Result {
 		}
 	}()
 
-	if err = tr(&tgt); err != nil {
+	if err = tr.Next(&tgt); err != nil {
 		a.Stop()
 		return &res
 	}
@@ -352,9 +354,14 @@ func (a *Attacker) hit(tr Targeter, name string) *Result {
 		body = io.LimitReader(r.Body, a.maxBody)
 	}
 
-	if res.Body, err = ioutil.ReadAll(body); err != nil {
+	res.Body, err = ioutil.ReadAll(body)
+	if err != nil {
+		tr.Result(nil, 0, err)
 		return &res
-	} else if _, err = io.Copy(ioutil.Discard, r.Body); err != nil {
+	}
+
+	if _, err = io.Copy(ioutil.Discard, r.Body); err != nil {
+		tr.Result(nil, 0, err)
 		return &res
 	}
 
@@ -367,6 +374,8 @@ func (a *Attacker) hit(tr Targeter, name string) *Result {
 	if res.Code = uint16(r.StatusCode); res.Code < 200 || res.Code >= 400 {
 		res.Error = r.Status
 	}
+
+	tr.Result(res.Body, res.Code, nil)
 
 	return &res
 }
