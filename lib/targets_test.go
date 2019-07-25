@@ -156,7 +156,7 @@ func TestJSONTargeter(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := NewJSONTargeter(tc.src, tc.body, tc.hdr)(tc.in)
+			err := NewJSONTargeter(tc.src, tc.body, tc.hdr).NewTargeter().Next(tc.in)
 			if got, want := tc.in, tc.out; !got.Equal(want) {
 				t.Errorf("got Target %#v, want %#v", got, want)
 			}
@@ -191,7 +191,7 @@ func TestReadAllTargets(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		in   Targeter
+		in   TargeterProvider
 		out  []Target
 		err  error
 	}{
@@ -275,8 +275,8 @@ func TestNewHTTPTargeter(t *testing.T) {
 			: 1234`,
 	} {
 		src := bytes.NewBufferString(strings.TrimSpace(def))
-		read := NewHTTPTargeter(src, []byte{}, http.Header{})
-		if got := read(&Target{}); got == nil || !strings.HasPrefix(got.Error(), want.Error()) {
+		tr := NewHTTPTargeter(src, []byte{}, http.Header{}).NewTargeter()
+		if got := tr.Next(&Target{}); got == nil || !strings.HasPrefix(got.Error(), want.Error()) {
 			t.Errorf("got: %s, want: %s\n%s", got, want, def)
 		}
 	}
@@ -318,7 +318,7 @@ func TestNewHTTPTargeter(t *testing.T) {
 	)
 
 	src := bytes.NewBufferString(strings.TrimSpace(targets))
-	read := NewHTTPTargeter(src, []byte{}, http.Header{"Content-Type": []string{"text/plain"}})
+	tr := NewHTTPTargeter(src, []byte{}, http.Header{"Content-Type": []string{"text/plain"}}).NewTargeter()
 	for _, want := range []Target{
 		{
 			Method: "GET",
@@ -376,14 +376,14 @@ func TestNewHTTPTargeter(t *testing.T) {
 		},
 	} {
 		var got Target
-		if err := read(&got); err != nil {
+		if err := tr.Next(&got); err != nil {
 			t.Fatal(err)
 		} else if !reflect.DeepEqual(want, got) {
 			t.Fatalf("want: %#v, got: %#v", want, got)
 		}
 	}
 	var got Target
-	if err := read(&got); err != ErrNoTargets {
+	if err := tr.Next(&got); err != ErrNoTargets {
 		t.Fatalf("got: %v, want: %v", err, ErrNoTargets)
 	} else if !reflect.DeepEqual(got, Target{}) {
 		t.Fatalf("got: %v, want: %v", got, nil)
@@ -394,11 +394,11 @@ func TestErrNilTarget(t *testing.T) {
 	t.Parallel()
 
 	for i, tr := range []Targeter{
-		NewStaticTargeter(Target{Method: "GET", URL: "http://foo.bar"}),
-		NewJSONTargeter(strings.NewReader(""), nil, nil),
-		NewHTTPTargeter(strings.NewReader("GET http://foo.bar"), nil, nil),
+		NewStaticTargeter(Target{Method: "GET", URL: "http://foo.bar"}).NewTargeter(),
+		NewJSONTargeter(strings.NewReader(""), nil, nil).NewTargeter(),
+		NewHTTPTargeter(strings.NewReader("GET http://foo.bar"), nil, nil).NewTargeter(),
 	} {
-		if got, want := tr(nil), ErrNilTarget; got != want {
+		if got, want := tr.Next(nil), ErrNilTarget; got != want {
 			t.Errorf("test #%d: got: %v, want: %v", i, got, want)
 		}
 	}
@@ -424,13 +424,6 @@ func BenchmarkJSONTargetEncoding(b *testing.B) {
 	b.Run("encode", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			enc.Encode(&targets[i%len(targets)])
-		}
-	})
-
-	dec := NewJSONTargeter(&buf, nil, nil)
-	b.Run("decode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			dec.Decode(&targets[i%len(targets)])
 		}
 	})
 }
