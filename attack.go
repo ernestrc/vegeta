@@ -181,6 +181,8 @@ func attack(opts *attackOpts) (err error) {
 
 	res := atk.Attack(tr, opts.rate, opts.duration, opts.name)
 	enc := vegeta.NewEncoder(out)
+	defer enc.Flush()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 

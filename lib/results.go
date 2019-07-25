@@ -121,17 +121,51 @@ func NewDecoder(rd io.Reader) Decoder {
 func (dec Decoder) Decode(r *Result) error { return dec(r) }
 
 // An Encoder encodes a Result and returns an error in case of failure.
-type Encoder func(*Result) error
+type Encoder interface {
+	Encode(*Result) error
+	Flush() error
+}
+
+type gobEncoder struct {
+	enc *gob.Encoder
+}
+
+func (e gobEncoder) Encode(r *Result) error {
+	return e.enc.Encode(r)
+}
+
+func (e gobEncoder) Flush() error {
+	return nil
+}
 
 // NewEncoder returns a new Result encoder closure for the given io.Writer
 func NewEncoder(r io.Writer) Encoder {
 	enc := gob.NewEncoder(r)
-	return func(r *Result) error { return enc.Encode(r) }
+	return gobEncoder{enc}
 }
 
-// Encode is an an adapter method calling the Encoder function itself with the
-// given parameters.
-func (enc Encoder) Encode(r *Result) error { return enc(r) }
+type csvEncoder struct {
+	enc *csv.Writer
+}
+
+func (e csvEncoder) Encode(r *Result) error {
+	return e.enc.Write([]string{
+		strconv.FormatInt(r.Timestamp.UnixNano(), 10),
+		strconv.FormatUint(uint64(r.Code), 10),
+		strconv.FormatInt(r.Latency.Nanoseconds(), 10),
+		strconv.FormatUint(r.BytesOut, 10),
+		strconv.FormatUint(r.BytesIn, 10),
+		r.Error,
+		base64.StdEncoding.EncodeToString(r.Body),
+		r.Attack,
+		strconv.FormatUint(r.Seq, 10),
+	})
+}
+
+func (e csvEncoder) Flush() error {
+	e.enc.Flush()
+	return e.enc.Error()
+}
 
 // NewCSVEncoder returns an Encoder that dumps the given *Result as a CSV
 // record. The columns are: UNIX timestamp in ns since epoch,
@@ -139,27 +173,7 @@ func (enc Encoder) Encode(r *Result) error { return enc(r) }
 // response body, and lastly the error.
 func NewCSVEncoder(w io.Writer) Encoder {
 	enc := csv.NewWriter(w)
-	return func(r *Result) error {
-		err := enc.Write([]string{
-			strconv.FormatInt(r.Timestamp.UnixNano(), 10),
-			strconv.FormatUint(uint64(r.Code), 10),
-			strconv.FormatInt(r.Latency.Nanoseconds(), 10),
-			strconv.FormatUint(r.BytesOut, 10),
-			strconv.FormatUint(r.BytesIn, 10),
-			r.Error,
-			base64.StdEncoding.EncodeToString(r.Body),
-			r.Attack,
-			strconv.FormatUint(r.Seq, 10),
-		})
-
-		if err != nil {
-			return err
-		}
-
-		enc.Flush()
-
-		return enc.Error()
-	}
+	return csvEncoder{enc}
 }
 
 // NewCSVDecoder returns a Decoder that decodes CSV encoded Results.
@@ -212,19 +226,29 @@ func NewCSVDecoder(rd io.Reader) Decoder {
 	}
 }
 
+type jsonEncoder struct {
+	jw jwriter.Writer
+	w  io.Writer
+}
+
+func (e *jsonEncoder) Encode(r *Result) error {
+	(*jsonResult)(r).encode(&e.jw)
+	if e.jw.Error != nil {
+		return e.jw.Error
+	}
+	e.jw.RawByte('\n')
+	_, err := e.jw.DumpTo(e.w)
+	return err
+}
+
+func (e *jsonEncoder) Flush() error {
+	return nil
+}
+
 // NewJSONEncoder returns an Encoder that dumps the given *Results as a JSON
 // object.
 func NewJSONEncoder(w io.Writer) Encoder {
-	var jw jwriter.Writer
-	return func(r *Result) error {
-		(*jsonResult)(r).encode(&jw)
-		if jw.Error != nil {
-			return jw.Error
-		}
-		jw.RawByte('\n')
-		_, err := jw.DumpTo(w)
-		return err
-	}
+	return &jsonEncoder{w: w}
 }
 
 // NewJSONDecoder returns a Decoder that decodes JSON encoded Results.

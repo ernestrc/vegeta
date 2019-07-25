@@ -94,6 +94,8 @@ func encode(files []string, to, output string) error {
 		return fmt.Errorf("encode: unknown encoding %q", to)
 	}
 
+	defer enc.Flush()
+
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, os.Interrupt)
 
